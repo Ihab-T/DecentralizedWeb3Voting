@@ -1,0 +1,10 @@
+{
+  "name": "afs-test",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "@openzeppelin/contracts": "^5.4.0",
+    "dotenv": "^16.4.5",
+    "hardhat": "^3.0.0"
+  }
+}

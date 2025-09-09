@@ -1,0 +1,4 @@
+# Ignore secrets
+.env
+.env.local
+.env.*.local

@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AFS Oracle Admin</title>
+  <style>
+    :root { --fg:#111; --muted:#666; --ok:#0a0; --err:#b00; --bd:#ddd; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+           max-width: 760px; margin: 24px auto; padding: 0 12px; color:var(--fg); }
+    h1 { margin: 0 0 6px; }
+    .muted{ color:var(--muted); font-size:14px; }
+    label{ display:block; margin:12px 0 6px; font-weight:600; }
+    input, textarea, button, select { font-size:16px; padding:8px 10px; }
+    input, textarea, select { width:100%; box-sizing:border-box; }
+    textarea{ resize:vertical; min-height:70px }
+    .row { display:grid; grid-template-columns: 1fr 180px; gap:12px; }
+    .card{ border:1px solid var(--bd); border-radius:10px; padding:14px; margin-top:16px; }
+    .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px }
+    .out { margin-top:12px; min-height:1.5em }
+    .ok{ color:var(--ok) } .err{ color:var(--err); white-space:pre-wrap }
+    a { color:#06c; text-decoration:none } a:hover{text-decoration:underline}
+    .small{ font-size:14px }
+    .tag { display:inline-block; padding:2px 6px; border:1px solid var(--bd); border-radius:6px; }
+  </style>
+</head>
+<body>
+  <h1>AFS Oracle Admin</h1>
+  <p class="muted small">Сервер: <span id="srv">…</span></p>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label>elementId (например, <code>floor1</code>)</label>
+        <input id="elementId" placeholder="floor1" />
+      </div>
+      <div>
+        <label>куда писать</label>
+        <select id="chain">
+          <option value="l2">L2 (Optimism Sepolia)</option>
+          <option value="l1">L1 (Sepolia)</option>
+        </select>
+        <label style="margin-top:10px">stage (0..255)</label>
+        <input id="stage" type="number" min="0" max="255" value="1" />
+      </div>
+    </div>
+
+    <label>Заметка (note)</label>
+    <textarea id="note" placeholder="произвольный текст (необязательно)"></textarea>
+
+    <label>API key (если включён на сервере)</label>
+    <input id="apiKey" placeholder="необязательно" />
+
+    <div class="actions" style="margin-top:8px">
+      <button id="btnLogin">Login with MetaMask (SIWE)</button>
+      <span id="who" class="small muted"></span>
+    </div>
+
+    <div class="actions">
+      <button id="btnSet">Set stage</button>
+      <button id="btnSetNote">Set note</button>
+      <button id="btnGet">Проверить текущий stage</button>
+      <button id="btnInfo">Получить info (stage + updatedAt + note)</button>
+      <a class="small" href="/history.html" target="_blank" rel="noreferrer">Открыть историю (history.html)</a>
+    </div>
+
+    <div id="out" class="out"></div>
+  </div>
+
+  <!-- UMD: siwe / ethers -->
+  <script src="https://cdn.jsdelivr.net/npm/siwe@2/dist/siwe.min.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/ethers@6.13.1/dist/ethers.umd.min.js" crossorigin="anonymous"></script>
+
+  <script>
+  (async function boot() {
+    const $   = (id) => document.getElementById(id);
+    const OUT = $('out');
+    const API = location.origin;
+
+    // --- helpers ------------------------------------------------------------
+    async function ensureEthers() {
+      if (window.ethers) return;
+      await new Promise((resolve) => {
+        const s = document.createElement('script');
+        s.src = 'https://unpkg.com/ethers@6.13.1/dist/ethers.umd.min.js';
+        s.async = true; s.onload = resolve; s.onerror = resolve;
+        document.head.appendChild(s);
+      });
+    }
+    await ensureEthers();
+    if (!window.ethers) { OUT.innerHTML = '<div class="err">Не удалось загрузить ethers.js.</div>'; return; }
+
+    async function fetchJsonWithFallback(url) {
+      const r = await fetch(url);
+      const txt = await r.text();
+      try { return JSON.parse(txt); }
+      catch { return { ok:false, error:`non-JSON response: ${txt.slice(0,300)}` }; }
+    }
+    async function fetchJSON(url, options = {}) {
+      const resp = await fetch(url, { headers:{'Accept':'application/json', ...(options.headers||{})}, ...options });
+      const ct   = (resp.headers.get('content-type') || '').toLowerCase();
+      const body = await resp.text();
+      if (ct.includes('application/json')) {
+        try { return { http: resp.status, ...JSON.parse(body) }; }
+        catch { return { ok:false, error:`bad_json (${resp.status})`, raw: body.slice(0,300) }; }
+      }
+      return { ok:false, error:`non-JSON (${resp.status})`, raw: body.slice(0,300) };
+    }
+
+    const ok  = (html) => OUT.innerHTML = `<div class="ok">${html}</div>`;
+    const err = (e)   => OUT.innerHTML = `<div class="err">${e}</div>`;
+
+    const API_KEY_STORE = 'afs_api_key';
+    const TOKEN_KEY     = 'afs_siwe_token';
+    const DID_KEY       = 'afs_siwe_did';
+
+    // ===== статус сервера / выбор сети ======================================
+    let STATUS_CACHE = null;
+    async function getStatus() {
+      try {
+        const s = await fetch(API + '/status').then(r => r.json());
+        return s.ok ? s : null;
+      } catch { return null; }
+    }
+    const activeSel      = () => ($('chain')?.value === 'l2' ? 'l2' : 'l1');
+    const activeInfo     = () => STATUS_CACHE?.[activeSel()] || null;
+    const activeChainId  = () => activeInfo()?.chainId;
+
+    function scanBase(chainId){
+      if (String(chainId) === '11155111') return 'https://sepolia.etherscan.io';
+      if (String(chainId) === '11155420') return 'https://sepolia-optimism.etherscan.io';
+      return 'https://etherscan.io';
+    }
+    function renderStatus() {
+      const el = $('srv');
+      if (!STATUS_CACHE) { el.textContent = API; return; }
+      const info = activeInfo() || {};
+      const base = scanBase(info.chainId || '');
+      const w = info.wallet  ? `<a class="tag" href="${base}/address/${info.wallet}" target="_blank" rel="noreferrer">${info.wallet}</a>` : '—';
+      const c = info.contract? `<a class="tag" href="${base}/address/${info.contract}" target="_blank" rel="noreferrer">${info.contract}</a>`: '—';
+      el.innerHTML = `${API} | chainId=${info.chainId ?? '—'} | wallet=${w} | contract=${c}`;
+    }
+    STATUS_CACHE = await getStatus(); renderStatus();
+    $('chain')?.addEventListener('change', () => { renderStatus(); detectV5AndToggle(); });
+
+    // API-KEY локальное хранение
+    $('apiKey').value = localStorage.getItem(API_KEY_STORE) || '';
+    $('apiKey').addEventListener('input', e => localStorage.setItem(API_KEY_STORE, e.target.value));
+
+    async function authHeaders(base = {'Content-Type':'application/json','Accept':'application/json'}) {
+      const h = { ...base };
+      const t = localStorage.getItem(TOKEN_KEY);
+      if (t) h['Authorization'] = 'Bearer ' + t;
+      const k = $('apiKey').value.trim();
+      if (k) h['x-api-key'] = k;
+      return h;
+    }
+
+    // ===== V5 detection & UI toggles ========================================
+    async function isV5(elementId, chain) {
+      try {
+        const r = await fetch(`${API}/v5/votes/${encodeURIComponent(elementId)}?chain=${encodeURIComponent(chain)}`);
+        const j = await r.json().catch(()=> ({}));
+        return !!j.ok; // если эндпоинт есть — это V5
+      } catch { return false; }
+    }
+    async function detectV5AndToggle() {
+      const elementId = ($('elementId').value || '_probe_').trim();
+      const chain = activeSel();
+      const v5 = await isV5(elementId, chain);
+
+      const dis = (id, on, title) => {
+        const b = $(id); if (!b) return;
+        b.disabled = on; b.title = on ? title : '';
+        b.style.opacity = on ? 0.5 : 1; b.style.cursor = on ? 'not-allowed' : 'pointer';
+      };
+      dis('btnSet',     v5, 'V5: стадия задаётся через 3/3 голосов');
+      dis('btnSetNote', v5, 'V5: note отсутствует');
+    }
+    $('elementId').addEventListener('input', detectV5AndToggle);
+    setTimeout(detectV5AndToggle, 300);
+
+    // ===== write: set-stage / set-note (для V3/V4) ==========================
+    $('btnSet').onclick = async () => {
+      const elementId = $('elementId').value.trim();
+      const stage = Number($('stage').value);
+      const chain = activeSel();
+      if (!elementId) return err('Заполните elementId');
+      if (!Number.isInteger(stage) || stage < 0 || stage > 255) return err('stage должен быть 0..255');
+
+      const headers = await authHeaders();
+      const j = await fetchJSON(API + '/set-stage', { method:'POST', headers, body: JSON.stringify({ elementId, stage, chain }) });
+      if (!j.ok) {
+        if (/insufficient funds/i.test(String(j.error))) {
+          const w = activeInfo()?.wallet || '(см. /status)';
+          return err(`Недостаточно газа на кошельке сервера. Пополните ${w}.`);
+        }
+        return err((j.error || 'Ошибка') + (j.raw ? `\nraw: ${j.raw}` : ''));
+      }
+      const base = scanBase(activeChainId());
+      ok(`OK. Tx: <a href="${base}/tx/${j.txHash}" target="_blank" rel="noreferrer">${j.txHash}</a><br/>block: ${j.blockNumber}`);
+    };
+
+    $('btnSetNote').onclick = async () => {
+      const elementId = $('elementId').value.trim();
+      const note = $('note').value;
+      const chain = activeSel();
+      if (!elementId) return err('Заполните elementId');
+
+      const headers = await authHeaders();
+      const j = await fetchJSON(API + '/set-note', { method:'POST', headers, body: JSON.stringify({ elementId, note, chain }) });
+      if (!j.ok) {
+        if (/insufficient funds/i.test(String(j.error))) {
+          const w = activeInfo()?.wallet || '(см. /status)';
+          return err(`Недостаточно газа на кошельке сервера. Пополните ${w}.`);
+        }
+        return err((j.error || 'Ошибка') + (j.raw ? `\nraw: ${j.raw}` : ''));
+      }
+      const base = scanBase(activeChainId());
+      ok(`OK. Tx: <a href="${base}/tx/${j.txHash}" target="_blank" rel="noreferrer">${j.txHash}</a><br/>block: ${j.blockNumber}`);
+    };
+
+    // ===== read: stage / info ===============================================
+    $('btnGet').onclick = async () => {
+      const elementId = $('elementId').value.trim();
+      if (!elementId) return err('Заполните elementId');
+      const chain = activeSel();
+
+      // если это V5 — считаем стадию по голосам (без вызова несуществующих функций)
+      if (await isV5(elementId, chain)) {
+        const v = await fetchJSON(`${API}/v5/votes/${encodeURIComponent(elementId)}?chain=${encodeURIComponent(chain)}`);
+        if (!v.ok) { err(v.error || 'Ошибка (V5)'); return; }
+        const votedAllYes = Array.isArray(v.voters) && v.voters.length > 0 && v.voters.every(x => !!x.voted);
+        ok(`Текущая стадия для <b>${elementId}</b>: <b>${votedAllYes ? 1 : 0}</b>`);
+        return;
+      }
+
+      // иначе — классический read с контракта V3/V4 через сервер
+      const j = await fetchJsonWithFallback(`${API}/stage-of/${encodeURIComponent(elementId)}?chain=${encodeURIComponent(chain)}`);
+      if (!j || !j.ok) { err(j?.error || 'Ошибка'); return; }
+      ok(`Текущая стадия для <b>${j.elementId}</b>: <b>${j.stage ?? '—'}</b>`);
+    };
+
+    $('btnInfo').onclick = async () => {
+      const elementId = $('elementId').value.trim();
+      if (!elementId) return err('Заполните elementId');
+      const chain = activeSel();
+
+      const j = await fetchJSON(`${API}/info/${encodeURIComponent(elementId)}?chain=${encodeURIComponent(chain)}`);
+      if (!j.ok) return err((j.error || 'Ошибка') + (j.raw ? `\nraw: ${j.raw}` : ''));
+
+      const when = j.updatedAt ? new Date(j.updatedAt * 1000).toLocaleString() : '—';
+      const safe = String(j.note ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;');
+      ok(`Info for <b>${j.elementId}</b>:
+           <br/>stage: <b>${j.stage ?? '—'}</b>
+           <br/>updatedAt: <b>${j.updatedAt ?? '—'}</b> (${when})
+           <br/>note: <pre style="margin:6px 0 0">${safe}</pre>`);
+    };
+    $('elementId').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnInfo').click(); });
+
+    // ===== SIWE Login =======================================================
+    function decodeJwtPayload(t) {
+      try {
+        const payload = t.split('.')[1] || '';
+        const b64 = payload.replace(/-/g,'+').replace(/_/g,'/');
+        const pad = b64 + '='.repeat((4 - b64.length % 4) % 4);
+        return JSON.parse(decodeURIComponent(escape(atob(pad))));
+      } catch { return {}; }
+    }
+    async function showLogged() {
+      const t = localStorage.getItem(TOKEN_KEY);
+      const did = localStorage.getItem(DID_KEY) || '';
+      if (!t) { $('who').textContent = ''; return; }
+
+      const claims = decodeJwtPayload(t);
+      const addr = claims?.sub || '';
+      const base = scanBase(activeChainId());
+      const whoText = did ? `DID: <b>${did}</b>` :
+        (addr ? `Logged as <a href="${base}/address/${addr}" target="_blank" rel="noreferrer">${addr}</a>` : 'Logged');
+      $('who').innerHTML = `${whoText} <button id="btnLogout" class="small" style="margin-left:8px">Logout</button>`;
+      $('btnLogout').onclick = () => {
+        localStorage.removeItem(TOKEN_KEY);
+        localStorage.removeItem(DID_KEY);
+        $('who').textContent = '';
+        ok('Logged out');
+      };
+    }
+    function buildSiweMessageFallback({ domain, address, statement, uri, version, chainId, nonce, issuedAt }) {
+      return (
+`${domain} wants you to sign in with your Ethereum account:
+${address}
+
+${statement}
+
+URI: ${uri}
+Version: ${version}
+Chain ID: ${chainId}
+Nonce: ${nonce}
+Issued At: ${issuedAt}`
+      );
+    }
+    async function fetchNonce() {
+      let j = await fetchJSON(API + '/auth/siwe/nonce');
+      if (!j?.ok) j = await fetchJSON(API + '/siwe/nonce');
+      return j;
+    }
+    async function verifySiwe(body) {
+      let j = await fetchJSON(API + '/auth/siwe/verify', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+      if (!j?.ok) j = await fetchJSON(API + '/siwe/verify',     { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+      return j;
+    }
+    async function siweLogin() {
+      try {
+        if (!window.ethereum) { err('MetaMask не найден'); return; }
+        const [addrRaw] = await window.ethereum.request({ method: 'eth_requestAccounts' });
+        if (!addrRaw) { err('Нет адреса'); return; }
+        const addr = ethers.getAddress(addrRaw);
+
+        const n = await fetchNonce();
+        if (!n || !n.ok || !n.nonce) { err(n?.error || 'Не удалось получить nonce'); return; }
+
+        const chainId = Number(activeChainId() ?? 1);
+        const payload = { domain: location.host, address: addr, statement: 'AFS Admin Login',
+                          uri: location.origin, version: '1', chainId, nonce: n.nonce, issuedAt: new Date().toISOString() };
+
+        const message = (window.siwe && typeof window.siwe.SiweMessage === 'function')
+          ? new window.siwe.SiweMessage(payload).prepareMessage()
+          : buildSiweMessageFallback(payload);
+
+        const signature = await window.ethereum.request({ method: 'personal_sign', params: [message, addr] });
+        const v = await verifySiwe({ message, signature });
+        if (!v.ok) { err(v.error || 'login failed'); return; }
+
+        localStorage.setItem(TOKEN_KEY, v.token);
+        if (v.did) localStorage.setItem(DID_KEY, v.did);
+        ok('Login OK'); showLogged();
+      } catch (e) { err(String(e?.message || e)); }
+    }
+    $('btnLogin').onclick = siweLogin;
+    showLogged();
+  })();
+  </script>
+</body>
+</html>

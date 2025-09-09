@@ -1,0 +1,20 @@
+{
+  "name": "afs-oracle",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "set:stage": "node scripts/setStage.mjs",
+    "test": "echo \"No tests\""
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "ethers": "^6.15.0",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.0.1",
+    "jsonwebtoken": "^9.0.2",
+    "siwe": "^3.0.0"
+  }
+}

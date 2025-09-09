@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Web3-Voting (V5)</title>
+  <style>
+    :root { --fg:#111; --muted:#666; --ok:#0a0; --err:#b00; --bd:#ddd; }
+    body { font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; max-width: 900px; margin:24px auto; padding:0 12px; color:var(--fg); }
+    h1 { margin: 0 0 6px; }
+    .muted{ color:var(--muted); font-size:14px; }
+    label{ display:block; margin:12px 0 6px; font-weight:600; }
+    input,select,button{ font-size:16px; padding:8px 10px; }
+    input,select{ width:100%; box-sizing:border-box; }
+    .card{ border:1px solid var(--bd); border-radius:10px; padding:14px; margin-top:16px; }
+    .row{ display:grid; grid-template-columns:1fr 260px; gap:12px; align-items:end; }
+    .actions{ display:flex; gap:8px; flex-wrap:wrap; margin-top:12px }
+    .ok{ color:var(--ok) } .err{ color:var(--err) }
+    .tag{ display:inline-block; padding:2px 6px; border:1px solid var(--bd); border-radius:6px; }
+    table{ width:100%; border-collapse:collapse; margin-top:8px; }
+    th,td{ border:1px solid var(--bd); padding:8px 10px; text-align:left; }
+    th{ background:#fafafa; }
+    .small{ font-size:14px }
+  </style>
+</head>
+<body>
+  <h1>Web3-Voting (V5)</h1>
+  <p class="muted small">Server: <span id="srv">…</span></p>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label>ElementId (Example: <code>floor1</code>)</label>
+        <input id="elementId" placeholder="floor1" value="floor1" />
+      </div>
+      <div>
+        <label>Network layer</label>
+        <select id="chain">
+          <option value="l2">L2 (Optimism Sepolia)</option>
+          <option value="l1">L1 (Sepolia)</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button id="btnConnect">Connect MetaMask</button>
+      <button id="btnCheck">Check status</button>
+    </div>
+
+    <div id="me" class="muted small" style="margin-top:8px"></div>
+
+    <div class="actions" style="margin-top:12px">
+      <button id="btnApprove">Approve (Yes)</button>
+      <button id="btnReject">Reject (No)</button>
+    </div>
+
+    <div class="muted small" style="margin-top:10px">
+      Contract <a id="contractLink" class="tag" href="#" target="_blank" rel="noreferrer">—</a>
+    </div>
+
+    <div id="out" style="margin-top:12px; min-height:1.5em"></div>
+
+    <div id="statusBlock" style="margin-top:10px; display:none">
+      <div class="small muted" id="statusHeader"></div>
+      <table id="tbl">
+        <thead>
+          <tr>
+            <th style="width:54px">#</th>
+            <th>Address (role)</th>
+            <th style="width:160px">Voted</th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Ethers UMD -->
+  <script src="https://cdn.jsdelivr.net/npm/ethers@6.13.1/dist/ethers.umd.min.js" crossorigin="anonymous"></script>
+
+  <script>
+  (async function () {
+    const $      = (id) => document.getElementById(id);
+    const OUT    = $('out');
+    const API    = location.origin;
+    let   STATUS = null;        // ответ /status
+    let   ROLES  = {};          // роли по сети
+    let   provider, signer, myAddr = '';
+
+    const ok  = (html) => OUT.innerHTML = `<div class="ok">${html}</div>`;
+    const err = (html) => OUT.innerHTML = `<div class="err">${html}</div>`;
+
+    // ---- утилиты
+    const toBytes32 = (s) => ethers.id(String(s).trim().toLowerCase());
+    const esc = (s) => String(s||'').replaceAll('&','&amp;').replaceAll('<','&lt;');
+
+    const scanBase = (chainId) =>
+      String(chainId) === '11155111' ? 'https://sepolia.etherscan.io'
+                                     : 'https://sepolia-optimism.etherscan.io';
+
+    // ---- загрузка /status и voters.json
+    async function loadStatus() {
+      try {
+        const j = await fetch(API + '/status').then(r => r.json());
+        if (j?.ok) {
+          STATUS = j;
+          $('srv').innerHTML =
+            `${API} | chainId=${(j[$('chain').value]||{}).chainId ?? '—'} | wallet=` +
+            (j[$('chain').value]?.wallet
+              ? `<a class="tag" href="${scanBase(j[$('chain').value].chainId)}/address/${j[$('chain').value].wallet}" target="_blank" rel="noreferrer">${j[$('chain').value].wallet}</a>`
+              : '—') +
+            ` | contract=` +
+            (j[$('chain').value]?.contract
+              ? `<a class="tag" href="${scanBase(j[$('chain').value].chainId)}/address/${j[$('chain').value].contract}" target="_blank" rel="noreferrer">${j[$('chain').value].contract}</a>`
+              : '—');
+          updateContractLink();
+        }
+      } catch {}
+    }
+
+    async function loadRoles() {
+      try {
+        const j = await fetch('/voters.json', {cache:'no-store'}).then(r=>r.json());
+        const chain = (STATUS && STATUS[$('chain').value]?.chainId) ? String(STATUS[$('chain').value].chainId) : '';
+        ROLES = chain && j[chain] ? normalizeKeys(j[chain]) : {};
+      } catch { ROLES = {}; }
+    }
+    const normalizeKeys = (obj) => {
+      const out = {};
+      Object.keys(obj||{}).forEach(k => out[k.toLowerCase()] = obj[k]);
+      return out;
+    };
+
+    function updateContractLink() {
+      const sel = $('chain').value;
+      const info = STATUS?.[sel];
+      const a = $('contractLink');
+      if (!info?.contract) { a.textContent = '—'; a.href='#'; return; }
+      a.textContent = info.contract;
+      a.href = `${scanBase(info.chainId)}/address/${info.contract}`;
+    }
+
+    // ---- MetaMask
+    async function connectMM() {
+      if (!window.ethereum) { err('MetaMask не найден'); return; }
+      try {
+        // попросим права — так чаще появляется системный диалог
+        try {
+          await window.ethereum.request({
+            method:'wallet_requestPermissions',
+            params:[{ eth_accounts:{} }]
+          });
+        } catch {}
+        const accs = await window.ethereum.request({ method:'eth_requestAccounts' });
+        myAddr = (accs && accs[0]) ? ethers.getAddress(accs[0]) : '';
+        provider = new ethers.BrowserProvider(window.ethereum);
+        signer   = await provider.getSigner();
+        showWho();
+        ok('MetaMask is connected');
+      } catch (e) {
+        err('Не удалось подключиться: ' + esc(e?.message || e));
+      }
+    }
+
+    function showWho() {
+      const did = `did:pkh:eip155:${STATUS?.[$('chain').value]?.chainId || '—'}:${myAddr || '—'}`;
+      $('me').innerHTML = `You: <b>${myAddr || '—'}</b> · DID: <span class="muted">${esc(did)}</span>`;
+    }
+
+    if (window.ethereum) {
+      window.ethereum.on?.('accountsChanged', (accs) => {
+        myAddr = (accs && accs[0]) ? ethers.getAddress(accs[0]) : '';
+        provider = new ethers.BrowserProvider(window.ethereum);
+        provider.getSigner().then(s => signer = s).catch(()=>{});
+        showWho();
+      });
+      window.ethereum.on?.('chainChanged', () => {
+        // просто перезагрузим — так надёжнее
+        location.reload();
+      });
+    }
+
+    // ---- ABI (минимум, только то, что используем)
+    const ABI = [
+      { "inputs":[{"internalType":"bytes32","name":"elementId","type":"bytes32"},{"internalType":"bool","name":"approve","type":"bool"}], "name":"vote", "outputs":[], "stateMutability":"nonpayable","type":"function" },
+      // опциональные «читалки» (если есть в контракте)
+      { "inputs":[{"internalType":"bytes32","name":"elementId","type":"bytes32"}], "name":"isFinalized", "outputs":[{"internalType":"bool","name":"","type":"bool"}], "stateMutability":"view","type":"function" },
+      { "inputs":[{"internalType":"bytes32","name":"elementId","type":"bytes32"},{"internalType":"address","name":"voter","type":"address"}], "name":"hasVoted", "outputs":[{"internalType":"bool","name":"","type":"bool"}], "stateMutability":"view","type":"function" }
+    ];
+
+    function getContractForSelectedChain(write=false) {
+      const sel  = $('chain').value;
+      const info = STATUS?.[sel];
+      if (!info?.contract) throw new Error('contract address неизвестен (см. /status)');
+      const prov = write ? provider : new ethers.JsonRpcProvider(sel==='l2' ? (STATUS?.l2Rpc || STATUS?.l2?.rpc) : (STATUS?.l1Rpc || STATUS?.l1?.rpc));
+      // для чтения используем провайдера по RPC, но у нас в /status нет uri — читаем через MM тоже:
+      const p = write || !window.ethereum ? (provider || new ethers.BrowserProvider(window.ethereum)) : new ethers.BrowserProvider(window.ethereum);
+      return new ethers.Contract(info.contract, ABI, write ? (signer || p) : p);
+    }
+
+    async function doVote(approve) {
+      try {
+        if (!signer) throw new Error('Сначала подключите MetaMask');
+        const el = $('elementId').value.trim();
+        if (!el) throw new Error('Введите elementId');
+        const id = toBytes32(el);
+
+        const ctr = getContractForSelectedChain(true);
+        const tx = await ctr.vote(id, approve);
+        ok(`Sent. Waiting for confirmation...<br/>Tx: <a target="_blank" rel="noreferrer" href="${scanBase(STATUS[$('chain').value].chainId)}/tx/${tx.hash}">${tx.hash}</a>`);
+        await tx.wait();
+        ok('Vote is counted ✅');
+        await checkStatus(); // сразу обновим таблицу
+      } catch (e) {
+        const m = String(e?.message || e);
+        if (/Already finalized/i.test(m)) {
+          err('Элемент уже финализирован (набрано 3/3 «Да»). Новые голоса не принимаются.');
+        } else if (/user rejected/i.test(m)) {
+          err('Отклонено пользователем в MetaMask.');
+        } else {
+          err('Ошибка отправки транзакции: ' + esc(m));
+        }
+      }
+    }
+
+    // ---- статус голосов
+    async function checkStatus() {
+      try {
+        const el = $('elementId').value.trim();
+        if (!el) { err('Введите elementId'); return; }
+        const id = toBytes32(el);
+        const ctr = getContractForSelectedChain(false);
+
+        // получаем список адресов-участников по выбранной сети из voters.json
+        await loadRoles();
+        const voters = Object.keys(ROLES || {});
+        if (!voters.length) {
+          err('Не найден файл voters.json или пустой список ролей для выбранной сети.');
+          return;
+        }
+
+        // спросим по каждому адресу «голосовал ли» (если в контракте есть hasVoted)
+        const rows = [];
+        for (let i=0;i<voters.length;i++) {
+          let voted = false;
+          try { voted = await ctr.hasVoted(id, voters[i]); } catch {}
+          rows.push({ addr: ethers.getAddress(voters[i]), voted: !!voted });
+        }
+
+        // финализация (если доступна)
+        let finalized = false;
+        try { finalized = await ctr.isFinalized(id); } catch {}
+
+        renderTable(el, rows, finalized);
+        ok(finalized ? 'Status: Votes status: In progress' : 'Votes status: Finalized');
+      } catch (e) {
+        err('Не удалось получить статусы: ' + esc(e?.message || e));
+      }
+    }
+
+    function renderTable(elementId, rows, finalized) {
+      $('statusBlock').style.display = 'block';
+      $('statusHeader').innerHTML =
+        `Voting status for <b>${esc(elementId)}</b>` +
+        (finalized ? ' · <span class="ok">финализировано</span>' : '');
+
+      const tb = $('tbody');
+      tb.innerHTML = '';
+      rows.forEach((r, i) => {
+        const tr = document.createElement('tr');
+        const role = ROLES[r.addr.toLowerCase()] || '';
+        tr.innerHTML =
+          `<td>${i+1}</td>` +
+          `<td>${r.addr}${role ? ` <span class="muted">(${esc(role)})</span>` : ''}</td>` +
+          `<td>${r.voted ? '✅ Yes' : '❌ No'}</td>`;
+        tb.appendChild(tr);
+      });
+    }
+
+    // ---- события UI
+    $('btnConnect').onclick = connectMM;
+    $('btnApprove').onclick = () => doVote(true);
+    $('btnReject').onclick  = () => doVote(false);
+    $('btnCheck').onclick   = checkStatus;
+
+    $('chain').addEventListener('change', async () => {
+      await loadStatus();
+      await loadRoles();
+      showWho();
+    });
+
+    $('elementId').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnCheck').click(); });
+
+    // ---- старт
+    await loadStatus();
+    await loadRoles();
+    showWho();
+  })();
+  </script>
+</body>
+</html>

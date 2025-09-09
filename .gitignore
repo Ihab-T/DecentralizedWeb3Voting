@@ -1,0 +1,63 @@
+# ===== common =====
+.DS_Store
+Thumbs.db
+*.log
+.env
+.env.*
+*.local
+
+# ===== Node/Hardhat (local, upgrades, oracle) =====
+node_modules/
+artifacts/
+cache/
+coverage/
+
+# Ignition local deploy
+ignition/deployments/chain-31337/
+
+# OpenZeppelin: local (hardhat) манифест НЕ храним
+.openzeppelin/unknown-31337.json
+
+# ===== Unity (ModelWeb3Voting) =====
+ModelWeb3Voting/Library/
+ModelWeb3Voting/Logs/
+ModelWeb3Voting/Obj/
+ModelWeb3Voting/obj/
+ModelWeb3Voting/Build/
+ModelWeb3Voting/Builds/
+ModelWeb3Voting/UserSettings/
+ModelWeb3Voting/.vs/
+ModelWeb3Voting/.idea/
+ModelWeb3Voting/*.csproj
+ModelWeb3Voting/*.sln
+ModelWeb3Voting/*.user
+ModelWeb3Voting/*.userprefs
+ModelWeb3Voting/*.unitypackage
+
+# ===== others =====
+**/addresses.local.json
+
+# Игнорируем зависимости
+**/node_modules/
+
+# Игнорируем артефакты компиляции Hardhat
+**/artifacts/
+**/cache/
+
+# Игнорируем системные папки Unity
+**/Library/
+**/Logs/
+**/obj/
+**/Temp/
+**/UserSettings/
+
+# Игнорируем приватные ключи и конфигурации
+.env
+*.env
+
+# Игнорируем IDE и временные файлы
+.vs/
+*.suo
+*.vscode/
+*.DS_Store
+Thumbs.db
